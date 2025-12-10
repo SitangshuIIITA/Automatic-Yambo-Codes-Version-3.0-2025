@@ -42,21 +42,52 @@ hbar = 1.054571817e-34
 kB = 1.380649e-23
 eV_to_J = 1.602176634e-19
 
-def detect_steady_state(snapshot_times, v_snapshot, rel_tol=0.03, bins_required=25):
-    count = 0
-    for i in range(1, len(v_snapshot)):
-        v0 = v_snapshot[i-1]
-        v1 = v_snapshot[i]
-        if v0 == 0:
+def detect_steady_state(snapshot_times, v_snapshot,
+                        window_fraction=0.10,
+                        rel_tol_slope=0.005,
+                        rel_cv=0.01,
+                        min_window=5):
+
+    if snapshot_times is None or v_snapshot is None:
+        return None
+
+    t = np.asarray(snapshot_times, dtype=float)
+    v = np.asarray(v_snapshot, dtype=float)
+    N = len(v)
+    if N < 2:
+        return None
+
+    win = max(min_window, int(np.ceil(window_fraction * N)))
+    if win >= N:
+        win = max(min_window, N // 2)
+
+    for end in range(win, N + 1):
+        start = end - win
+        t_win = t[start:end]
+        v_win = v[start:end]
+
+        mean_v = np.mean(v_win)
+        std_v  = np.std(v_win)
+
+        try:
+            slope, intercept = np.polyfit(t_win, v_win, 1)
+        except Exception:
             continue
-        rel_change = abs(v1 - v0) / max(abs(v0), 1e-30)
-        if rel_change < rel_tol:
-            count += 1
-            if count >= bins_required:
-                return snapshot_times[i - bins_required]
-        else:
-            count = 0
+
+        window_duration = t_win[-1] - t_win[0] if t_win[-1] != t_win[0] else 1.0
+
+        normalized_slope = abs(slope) * window_duration / (abs(mean_v) + 1e-30)
+
+        slope_ok = True if abs(mean_v) < 1e-12 else (normalized_slope < rel_tol_slope)
+        cv_ok    = std_v / (abs(mean_v) + 1e-30) < rel_cv
+
+        if slope_ok and cv_ok:
+            idx_center = start + win // 2
+            return float(t[idx_center])
+
     return None
+
+
 
 
 # ---------- Data container ----------
@@ -220,9 +251,13 @@ def run_field(events:EventsTable, state_Gamma_tot, state_cum, ik_list, ik_to_rep
 
     # snapshot config
     snapshots = 200
-    snapshot_times = np.linspace(0.0, T_sim, snapshots)
-    bin_time  = np.zeros(snapshots, dtype=np.float64)
-    bin_vtime = np.zeros(snapshots, dtype=np.float64)
+    # snapshot_times must define BIN EDGES, not bin centers
+    snapshot_times = np.linspace(0.0, T_sim, snapshots + 1)
+
+    # number of bins = snapshots
+    bin_time = np.zeros(snapshots, dtype=float)
+    bin_vtime = np.zeros(snapshots, dtype=float)
+
 
     N_snap = snapshots
     N_ik = len(ik_list)
@@ -260,32 +295,41 @@ def run_field(events:EventsTable, state_Gamma_tot, state_cum, ik_list, ik_to_rep
         else:
             pop_bins[i0:i1+1, ik_pos, ib] += 1
 
+    
+    
     def _accumulate_snapshot(t0, dt, vx):
         if dt <= 0:
             return
+
         t1 = t0 + dt
-        f0 = max(0.0, min(1.0, t0 / T_sim))
-        f1 = max(0.0, min(1.0, t1 / T_sim))
-        i0 = int(f0 * (N_snap - 1))
-        i1 = int(f1 * (N_snap - 1))
-        if i0 == i1:
-            bin_time[i0]  += dt
-            bin_vtime[i0] += vx * dt
-        else:
-            t_edge = snapshot_times[i0+1] if i0+1 < snapshots else T_sim
-            dt0 = min(dt, t_edge - t0)
-            bin_time[i0]  += dt0
-            bin_vtime[i0] += vx * dt0
-            for ib in range(i0+1, i1):
-                tb0 = snapshot_times[ib]
-                tb1 = snapshot_times[ib+1] if ib+1 < snapshots else T_sim
-                dtb = tb1 - tb0
-                bin_time[ib]  += dtb
-                bin_vtime[ib] += vx * dtb
-            tb0 = snapshot_times[i1]
-            dt_last = max(0.0, t1 - tb0)
-            bin_time[i1]  += dt_last
-            bin_vtime[i1] += vx * dt_last
+        if t1 > T_sim:
+            t1 = T_sim
+
+        # Bin edges: snapshot_times is already an array of size N_snap
+        edges = snapshot_times
+
+        # Find which bins t0 and t1 fall into
+        i0 = np.searchsorted(edges, t0, side='right') - 1
+        i1 = np.searchsorted(edges, t1, side='right') - 1
+
+        # Clamp to valid range
+        i0 = max(i0, 0)
+        i1 = max(i1, 0)
+
+        # Loop over all bins between i0 and i1
+        for ib in range(i0, i1 + 1):
+            # Bin boundaries
+            b0 = edges[ib]
+            b1 = edges[ib+1] if ib + 1 < len(edges) else T_sim
+
+            # Intersection of [t0, t1] with this bin
+            lo = max(t0, b0)
+            hi = min(t1, b1)
+
+            dt_bin = hi - lo
+            if dt_bin > 0:
+                bin_time[ib]  += dt_bin
+                bin_vtime[ib] += vx * dt_bin
 
     # Reset particle statistics
     for p in particles:
@@ -312,6 +356,14 @@ def run_field(events:EventsTable, state_Gamma_tot, state_cum, ik_list, ik_to_rep
             dt = -math.log(rng.random()) / Gtot
             if p.t + dt > T_sim:
                 dt = T_sim - p.t
+            # ----------------------------------------------------
+            # OPTION A: Clamp dt to avoid huge free-flight segments
+            # spanning many bins and flattening vx(t).
+            # This does NOT change physics — only sampling of time.
+            # ----------------------------------------------------
+            bin_width = T_sim / snapshots
+            dt = min(dt, bin_width) 
+            
             # free flight k-update: precompute can be used by caller per-field if desired
             dk_cart = np.array([-(q * E_field / hbar) * dt, 0.0, 0.0])
             dk_frac = invB.dot(dk_cart)
@@ -452,13 +504,13 @@ def run_field(events:EventsTable, state_Gamma_tot, state_cum, ik_list, ik_to_rep
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='MPI Full-band EMC runner')
     parser.add_argument('--h5', type=str, default='scattering_events.h5', help='HDF5 events file')
-    parser.add_argument('--npar', type=int, default=500, help='Number of particles (ensemble)')
+    parser.add_argument('--npar', type=int, default=2000, help='Number of particles (ensemble)')
     parser.add_argument('--tsim', type=float, default=5e-12, help='Simulation time per particle (s)')
     parser.add_argument('--Emin', type=float, default=1e3, help='Min field V/m')
     parser.add_argument('--Emax', type=float, default=1e8, help='Max field V/m')
     parser.add_argument('--nE', type=int, default=6, help='Number of field points')
     parser.add_argument('--interp', action='store_true', help='Enable v(k) interpolation (slow)')
-    parser.add_argument('--maxsteps', type=int, default=1000, help='Max steps per particle (cap)')
+    parser.add_argument('--maxsteps', type=int, default=20000, help='Max steps per particle (cap)')
     args = parser.parse_args()
 
     # Option B ASCII header (user selected)
@@ -898,6 +950,32 @@ if __name__ == '__main__':
             # ============================================
             report("===== FIELD SUMMARY =====")
             report(f"Electric field           : {E:.3e} V/m")
+            
+            
+            report(f"\n"
+                      "# ------------------------------------------------------------\n"
+                      "# DEFINITION OF VELOCITIES\n"
+                      "# ------------------------------------------------------------\n"
+                      "# steady_state_time (t_ss):\n"
+                      "#   Time at which the instantaneous velocity v(t) becomes locally\n"
+                      "#   stationary. This is detected by scanning a sliding window where:\n"
+                      "#        (1) normalized slope  < rel_tol_slope\n"
+                      "#        (2) coefficient of variation < rel_cv\n"
+                      "#   t_ss marks the onset of local steady-state transport BEFORE any\n"
+                      "#   long-time valley trapping or redistribution occurs.\n"
+                      "#\n"
+                      "# steady_state_vx:\n"
+                      "#   The instantaneous velocity v(t_ss). This represents the transient\n"
+                      "#   steady-state velocity just after acceleration and prior to any\n"
+                      "#   later inter/intra-valley relaxation.\n"
+                      "#\n"
+                      "# drift_velocity:\n"
+                      "#   The full time-averaged velocity over the entire trajectory:\n"
+                      "#          <v> = ∫ v(t) dt  / ∫ dt\n"
+                      "#   This may be lower than steady_state_vx if electrons later relax\n"
+                      "#   into slower valleys or long-lived low-velocity states.\n"
+                      "# ------------------------------------------------------------\n"
+                  )
             report(f"Drift velocity           : {drift:.6e} m/s")
             report(f"Mean carrier energy      : {meanE:.6f} meV")
             report(f"Avg. scatter count       : {mean_s:.3f}")
@@ -933,6 +1011,31 @@ if __name__ == '__main__':
             try:
                 with open(ssfile, "w") as fss:
                     fss.write(f"# Steady state info for E={E:.3e} V/m\n")
+                    fss.write(f"# ------------------------------------------------------------\n"
+                               "# DEFINITION OF VELOCITIES\n"
+                               "# ------------------------------------------------------------\n"
+                               "# steady_state_time (t_ss):\n"
+                               "#   Time at which the instantaneous velocity v(t) becomes locally\n"
+                               "#   stationary. This is detected by scanning a sliding window where:\n"
+                               "#        (1) normalized slope  < rel_tol_slope\n"
+                               "#        (2) coefficient of variation < rel_cv\n"
+                               "#   t_ss marks the onset of local steady-state transport BEFORE any\n"
+                               "#   long-time valley trapping or redistribution occurs.\n"
+                               "#\n"
+                               "# steady_state_vx:\n"
+                               "#   The instantaneous velocity v(t_ss). This represents the transient\n"
+                               "#   steady-state velocity just after acceleration and prior to any\n"
+                               "#   later inter/intra-valley relaxation.\n"
+                               "#\n"
+                               "# drift_velocity:\n"
+                               "#   The full time-averaged velocity over the entire trajectory:\n"
+                               "#          <v> = ∫ v(t) dt  / ∫ dt\n"
+                               "#   This may be lower than steady_state_vx if electrons later relax\n"
+                               "#   into slower valleys or long-lived low-velocity states.\n"
+                               "# ------------------------------------------------------------\n"
+                    )
+
+                    
                     if t_ss is not None:
                         vx_ss = v_snapshot_tot[np.argmin(abs(snapshot_times - t_ss))]
                         fss.write(f"steady state time in s    : {t_ss:.6e}\n")
